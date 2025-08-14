@@ -1,0 +1,849 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  Shuffle,
+  Repeat,
+  Volume2,
+  VolumeX,
+  Plus,
+  Trash2,
+  Upload,
+  Disc3,
+  User,
+  Image as ImageIcon,
+  Music2,
+  Check,
+  LogOut,
+  ArrowLeft,
+} from "lucide-react";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
+
+// =========================================================
+// OpenAudio — Player + Playlists + Covers + Local Auth (MVP)
+// + Playlist Detail View (à la Spotify)
+// + Optional Supabase backup/sync (storage JSON) — fallback local
+// =========================================================
+
+// ------------------------ Types ------------------------
+type User = {
+  id: string;
+  username: string;
+  passwordHash: string; // WARNING: local + weak hash (demo only)
+  avatar?: string;
+  color?: string;
+  createdAt: number;
+};
+
+type Track = {
+  id: string;
+  userId: string;
+  title: string;
+  artist?: string;
+  url: string; // direct audio or blob URL
+  cover?: string; // image URL or blob URL
+  duration?: number; // seconds
+  createdAt: number;
+};
+
+type Playlist = {
+  id: string;
+  userId: string;
+  title: string;
+  cover?: string;
+  color?: string;
+  createdAt: number;
+  trackIds: string[];
+};
+
+// ------------------------ Utils ------------------------
+const uid = (): string => Math.random().toString(36).slice(2, 10);
+const now = (): number => Date.now();
+const fmtTime = (s: number): string => {
+  if (!isFinite(s) || s < 0) return "0:00";
+  const m = Math.floor(s / 60);
+  const ss = Math.floor(s % 60).toString().padStart(2, "0");
+  return `${m}:${ss}`;
+};
+const hash = (s: string): string => {
+  try {
+    return btoa(unescape(encodeURIComponent(s)));
+  } catch {
+    return s;
+  }
+};
+
+// Namespaced storage per user
+const LS = {
+  USERS: "oa.users.v1",
+  CURRENT: "oa.currentUserId.v1",
+  tracksKey: (uid: string) => `oa.${uid}.tracks.v1`,
+  playlistsKey: (uid: string) => `oa.${uid}.playlists.v1`,
+  settingsKey: (uid: string) => `oa.${uid}.settings.v2`,
+  supaKey: "oa.supabase.config.v1",
+};
+
+// Safe localStorage helpers
+const readLS = <T,>(k: string, fallback: T): T => {
+  try {
+    const raw = localStorage.getItem(k);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+const writeLS = (k: string, v: unknown): void => {
+  try {
+    localStorage.setItem(k, JSON.stringify(v));
+  } catch {}
+};
+
+// ------------------------ Supabase Sync (optional) ------------------------
+function useSupabase() {
+  const [cfg, setCfg] = useState<{ url: string; key: string; bucket: string } | null>(() => readLS(LS.supaKey, null));
+  const [client, setClient] = useState<SupabaseClient | null>(null);
+  useEffect(() => {
+    writeLS(LS.supaKey, cfg);
+    if (cfg && cfg.url && cfg.key) setClient(createClient(cfg.url, cfg.key));
+    else setClient(null);
+  }, [cfg]);
+  return { cfg, setCfg, client };
+}
+
+async function supaSaveSnapshot(client: SupabaseClient, bucket: string, userId: string, data: unknown): Promise<void> {
+  try {
+    const json = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const path = `${userId}/snapshot.json`;
+    await client.storage.from(bucket).upload(path, json, { upsert: true, contentType: "application/json" });
+  } catch (e) {
+    console.warn("Supabase sync failed", e);
+  }
+}
+
+// ------------------------ Auth Hook ------------------------
+function useLocalAuth() {
+  const [users, setUsers] = useState<User[]>(() => readLS<User[]>(LS.USERS, []));
+  const [currentUserId, setCurrentUserId] = useState<string | null>(() => readLS<string | null>(LS.CURRENT, null));
+
+  useEffect(() => writeLS(LS.USERS, users), [users]);
+  useEffect(() => writeLS(LS.CURRENT, currentUserId), [currentUserId]);
+
+  const currentUser = useMemo(() => users.find((u) => u.id === currentUserId) || null, [users, currentUserId]);
+
+  const signUp = (username: string, password: string): { ok: boolean; error?: string } => {
+    username = username.trim();
+    if (!username || !password) return { ok: false, error: "Usuario y contraseña requeridos" };
+    if (users.some((u) => u.username.toLowerCase() === username.toLowerCase())) return { ok: false, error: "Nombre de usuario ya existe" };
+    const u: User = { id: uid(), username, passwordHash: hash(password), createdAt: now(), color: "#111827" };
+    setUsers((prev) => [...prev, u]);
+    setCurrentUserId(u.id);
+    return { ok: true };
+  };
+
+  const signIn = (username: string, password: string): { ok: boolean; error?: string } => {
+    const user = users.find((u) => u.username.toLowerCase() === username.trim().toLowerCase());
+    if (!user) return { ok: false, error: "Usuario no encontrado" };
+    if (user.passwordHash !== hash(password)) return { ok: false, error: "Contraseña incorrecta" };
+    setCurrentUserId(user.id);
+    return { ok: true };
+  };
+
+  const signOut = (): void => setCurrentUserId(null);
+
+  const updateCurrent = (patch: Partial<User>): void => {
+    if (!currentUser) return;
+    setUsers((prev) => prev.map((u) => (u.id === currentUser.id ? { ...u, ...patch } : u)));
+  };
+
+  return { users, currentUser, currentUserId, signUp, signIn, signOut, updateCurrent };
+}
+
+// ------------------------ Data Hook (per user) ------------------------
+function useUserData(userId: string | null, supa: { client: SupabaseClient | null; cfg: { url: string; key: string; bucket: string } | null }) {
+  const tracksKey = userId ? LS.tracksKey(userId) : "";
+  const playlistsKey = userId ? LS.playlistsKey(userId) : "";
+  const settingsKey = userId ? LS.settingsKey(userId) : "";
+
+  const [tracks, setTracks] = useState<Track[]>(() => (userId ? readLS<Track[]>(tracksKey, []) : []));
+  const [playlists, setPlaylists] = useState<Playlist[]>(() => (userId ? readLS<Playlist[]>(playlistsKey, []) : []));
+  const [settings, setSettings] = useState<{ volume: number; loop: boolean; shuffle: boolean; currentIndex: number; queue: string[]; queueIndex: number }>(() =>
+    userId ? readLS(settingsKey, { volume: 0.8, loop: false, shuffle: false, currentIndex: 0, queue: [], queueIndex: 0 }) : { volume: 0.8, loop: false, shuffle: false, currentIndex: 0, queue: [], queueIndex: 0 }
+  );
+
+  // persist local
+  useEffect(() => { if (userId) writeLS(tracksKey, tracks); }, [userId, tracks, tracksKey]);
+  useEffect(() => { if (userId) writeLS(playlistsKey, playlists); }, [userId, playlists, playlistsKey]);
+  useEffect(() => { if (userId) writeLS(settingsKey, settings); }, [userId, settings, settingsKey]);
+
+  // best-effort Supabase snapshot sync
+  useEffect(() => {
+    if (!userId || !supa.client || !supa.cfg) return;
+    const payload = { tracks, playlists, settings, ts: Date.now() };
+    supaSaveSnapshot(supa.client, supa.cfg.bucket, userId, payload);
+  }, [tracks, playlists, settings, userId, supa.client, supa.cfg]);
+
+  return { tracks, setTracks, playlists, setPlaylists, settings, setSettings };
+}
+
+// ------------------------ Modal ------------------------
+function Modal({ open, onClose, children, title }: { open: boolean; onClose: () => void; children: React.ReactNode; title?: string }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/70" onClick={onClose} />
+      <div className="relative bg-slate-900 border border-slate-700 rounded-2xl p-4 w-full max-w-lg mx-auto shadow-xl">
+        {title ? <h3 className="text-lg font-semibold mb-3">{title}</h3> : null}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ------------------------ Main Component ------------------------
+export default function OpenAudioApp() {
+  // Supabase (optional)
+  const supabase = useSupabase();
+  // Auth
+  const { currentUser, signIn, signUp, signOut, updateCurrent } = useLocalAuth();
+  const { tracks, setTracks, playlists, setPlaylists, settings, setSettings } = useUserData(currentUser?.id ?? null, supabase);
+
+  // Player state
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  // Selection state for Add-to-Playlist modal
+  const [addModalTrackId, setAddModalTrackId] = useState<string | null>(null);
+  const [selectedPlaylistIds, setSelectedPlaylistIds] = useState<Set<string>>(new Set());
+
+  // Playlist detail view
+  const [activePlaylistId, setActivePlaylistId] = useState<string | null>(null);
+
+  const sortedPlaylists = useMemo(() => {
+    const copy = [...playlists];
+    copy.sort((a, b) => a.title.localeCompare(b.title));
+    return copy;
+  }, [playlists]);
+
+  // Active track depends on queue if defined
+  const activeTrackId = settings.queue.length ? settings.queue[settings.queueIndex] : tracks[settings.currentIndex]?.id;
+  const active = tracks.find((t) => t.id === activeTrackId) || null;
+
+  // ---------- Player Handlers ----------
+  const handleLoaded = (): void => {
+    const a = audioRef.current;
+    if (!a) return;
+    setDuration(a.duration || 0);
+    // store duration back to track
+    if (active) {
+      setTracks((prev) => prev.map((t) => (t.id === active.id ? { ...t, duration: Math.floor(a.duration || t.duration || 0) } : t)));
+    }
+  };
+  const handleTime = (): void => {
+    const a = audioRef.current;
+    if (!a) return;
+    setProgress(a.currentTime || 0);
+  };
+  const handleEnd = (): void => {
+    if (settings.loop) {
+      seek(0);
+      handlePlay();
+    } else {
+      next();
+    }
+  };
+  const handlePlay = async (): Promise<void> => {
+    const a = audioRef.current;
+    if (!a) return;
+    try {
+      await a.play();
+      setIsPlaying(true);
+    } catch (e) {
+      console.warn(e);
+    }
+  };
+  const handlePause = (): void => {
+    audioRef.current?.pause();
+    setIsPlaying(false);
+  };
+  const togglePlay = (): void => {
+    if (isPlaying) handlePause(); else handlePlay();
+  };
+  const seek = (sec: number): void => {
+    const a = audioRef.current;
+    if (!a) return;
+    const t = Math.min(Math.max(0, sec), duration || 0);
+    a.currentTime = t;
+    setProgress(t);
+  };
+  const skip = (delta: number): void => seek(progress + delta);
+  const setVol = (v: number): void => {
+    const a = audioRef.current;
+    const clamped = Math.min(Math.max(0, v), 1);
+    if (a) a.volume = clamped;
+    setSettings({ ...settings, volume: clamped });
+  };
+
+  const setQueue = (ids: string[], startIndex = 0): void => {
+    setSettings({ ...settings, queue: ids, queueIndex: Math.max(0, Math.min(ids.length - 1, startIndex)) });
+  };
+
+  const prev = (): void => {
+    if (settings.queue.length) {
+      const i = (settings.queueIndex - 1 + settings.queue.length) % settings.queue.length;
+      setSettings({ ...settings, queueIndex: i });
+      return;
+    }
+    if (!tracks.length) return;
+    const i = (settings.currentIndex - 1 + tracks.length) % tracks.length;
+    setSettings({ ...settings, currentIndex: i });
+  };
+  const next = (): void => {
+    if (settings.queue.length) {
+      if (settings.shuffle) {
+        const i = Math.floor(Math.random() * settings.queue.length);
+        setSettings({ ...settings, queueIndex: i });
+      } else {
+        const i = (settings.queueIndex + 1) % settings.queue.length;
+        setSettings({ ...settings, queueIndex: i });
+      }
+      return;
+    }
+    if (!tracks.length) return;
+    if (settings.shuffle) {
+      const i = Math.floor(Math.random() * tracks.length);
+      setSettings({ ...settings, currentIndex: i });
+      return;
+    }
+    const i = (settings.currentIndex + 1) % tracks.length;
+    setSettings({ ...settings, currentIndex: i });
+  };
+
+  useEffect(() => {
+    if (!audioRef.current) return;
+    audioRef.current.pause();
+    audioRef.current.load();
+    setProgress(0);
+    if (isPlaying) {
+      audioRef.current.play().catch(() => {});
+    }
+  }, [active?.url]);
+
+  useEffect(() => { setVol(settings.volume); }, []);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+      if (e.code === "Space") { e.preventDefault(); togglePlay(); }
+      else if (e.code === "ArrowRight") skip(5);
+      else if (e.code === "ArrowLeft") skip(-5);
+      else if (e.code === "ArrowUp") setVol(settings.volume + 0.05);
+      else if (e.code === "ArrowDown") setVol(settings.volume - 0.05);
+      else if (e.code === "KeyN") next();
+      else if (e.code === "KeyP") prev();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settings.volume, isPlaying, progress, duration, tracks.length, settings.shuffle, settings.queue, settings.queueIndex]);
+
+  // Media Session API
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || !active) return;
+    try {
+      // @ts-ignore
+      navigator.mediaSession.metadata = new window.MediaMetadata({
+        title: active.title,
+        artist: active.artist || "",
+        artwork: active.cover ? [{ src: active.cover, sizes: "512x512", type: "image/jpeg" }] : [],
+      });
+      // @ts-ignore
+      navigator.mediaSession.setActionHandler("play", () => handlePlay());
+      // @ts-ignore
+      navigator.mediaSession.setActionHandler("pause", () => handlePause());
+      // @ts-ignore
+      navigator.mediaSession.setActionHandler("previoustrack", () => prev());
+      // @ts-ignore
+      navigator.mediaSession.setActionHandler("nexttrack", () => next());
+      // @ts-ignore
+      navigator.mediaSession.setActionHandler("seekto", (e: any) => { if (audioRef.current && e.seekTime != null) audioRef.current.currentTime = e.seekTime; });
+    } catch {}
+  }, [active]);
+
+  // ---------- Add track (file/URL + cover file) ----------
+  const [newTitle, setNewTitle] = useState("");
+  const [newArtist, setNewArtist] = useState("");
+  const [newAudioUrl, setNewAudioUrl] = useState("");
+  const [newAudioFile, setNewAudioFile] = useState<File | null>(null);
+  const [newCoverFile, setNewCoverFile] = useState<File | null>(null);
+  const [newCoverUrl, setNewCoverUrl] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const onPickAudio = (files: FileList | null): void => {
+    const f = files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith("audio/")) { setFormError("El archivo seleccionado no es de audio"); return; }
+    setFormError(null);
+    setNewAudioFile(f);
+    if (!newTitle) setNewTitle(f.name.replace(/\.[^.]+$/, ""));
+  };
+
+  const onPickCover = (files: FileList | null): void => {
+    const f = files?.[0];
+    if (!f) return;
+    if (!f.type.startsWith("image/")) { setFormError("La portada debe ser una imagen"); return; }
+    if (f.size > 5 * 1024 * 1024) { setFormError("La portada no debe superar 5MB"); return; }
+    setFormError(null);
+    setNewCoverFile(f);
+  };
+
+  const addTrack = async (): Promise<void> => {
+    if (!currentUser) { setFormError("Debes iniciar sesión"); return; }
+    if (!newAudioFile && !newAudioUrl) { setFormError("Sube un audio o pega una URL"); return; }
+
+    let audioUrl = newAudioUrl.trim();
+    if (newAudioFile) {
+      audioUrl = URL.createObjectURL(newAudioFile);
+    }
+
+    let coverUrl = newCoverUrl.trim();
+    if (newCoverFile) coverUrl = URL.createObjectURL(newCoverFile);
+
+    const track: Track = {
+      id: uid(),
+      userId: currentUser.id,
+      title: newTitle.trim() || (newAudioFile ? newAudioFile.name : "Sin título"),
+      artist: newArtist.trim() || undefined,
+      url: audioUrl,
+      cover: coverUrl || undefined,
+      createdAt: now(),
+    };
+
+    setTracks((p) => [...p, track]);
+    // Reset form
+    setNewTitle(""); setNewArtist(""); setNewAudioUrl(""); setNewAudioFile(null); setNewCoverFile(null); setNewCoverUrl(""); setFormError(null);
+    if (tracks.length === 0) setSettings({ ...settings, currentIndex: 0 });
+  };
+
+  // ---------- Playlists ----------
+  const [plTitle, setPlTitle] = useState("");
+  const [plColor, setPlColor] = useState("#22c55e");
+  const [plCoverFile, setPlCoverFile] = useState<File | null>(null);
+
+  const createPlaylist = (): void => {
+    if (!currentUser) return;
+    if (!plTitle.trim()) return;
+    const cover = plCoverFile ? URL.createObjectURL(plCoverFile) : undefined;
+    const pl: Playlist = { id: uid(), userId: currentUser.id, title: plTitle.trim(), color: plColor, cover, createdAt: now(), trackIds: [] };
+    setPlaylists((p) => [...p, pl]);
+    setPlTitle(""); setPlCoverFile(null);
+  };
+
+  const removeTrack = (id: string): void => {
+    setTracks((p) => p.filter((t) => t.id !== id));
+    setPlaylists((pls) => pls.map((pl) => ({ ...pl, trackIds: pl.trackIds.filter((tid) => tid !== id) })));
+    if (active?.id === id) {
+      setSettings({ ...settings, currentIndex: 0, queue: [], queueIndex: 0 });
+    }
+  };
+
+  // Open modal for track
+  const openAddModal = (trackId: string): void => {
+    setAddModalTrackId(trackId);
+    const preselected = new Set<string>();
+    playlists.forEach((pl) => { if (pl.trackIds.includes(trackId)) preselected.add(pl.id); });
+    setSelectedPlaylistIds(preselected);
+  };
+  const toggleSelectPl = (plId: string): void => {
+    setSelectedPlaylistIds((s) => {
+      const next = new Set(s);
+      if (next.has(plId)) next.delete(plId); else next.add(plId);
+      return next;
+    });
+  };
+  const confirmAddToPlaylists = (): void => {
+    const tId = addModalTrackId;
+    if (!tId) return;
+    const chosen = new Set(selectedPlaylistIds);
+    setPlaylists((pls) => pls.map((pl) => {
+      const has = pl.trackIds.includes(tId);
+      const shouldHave = chosen.has(pl.id);
+      if (shouldHave && !has) return { ...pl, trackIds: [...pl.trackIds, tId] };
+      if (!shouldHave && has) return { ...pl, trackIds: pl.trackIds.filter((x) => x !== tId) };
+      return pl;
+    }));
+    setAddModalTrackId(null);
+  };
+
+  // --------------- Auth UI State ---------------
+  const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
+  const [authUser, setAuthUser] = useState("");
+  const [authPass, setAuthPass] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const doAuth = (): void => {
+    const u = authUser.trim();
+    const p = authPass;
+    const res = authMode === "signup" ? signUp(u, p) : signIn(u, p);
+    if (!res.ok) setAuthError(res.error || "Error"); else { setAuthError(null); setAuthUser(""); setAuthPass(""); }
+  };
+
+  // UI Helpers
+  const isMuted = settings.volume <= 0.001;
+
+  // If not logged in → show auth screen
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-slate-900 to-black text-slate-100 p-6 grid place-items-center">
+        <div className="w-full max-w-md bg-slate-900/70 border border-slate-700 rounded-2xl p-6">
+          <div className="flex items-center gap-2 mb-4"><Music2 className="w-5 h-5" /><h1 className="text-lg font-semibold">OpenAudio — Inicia sesión</h1></div>
+          <div className="space-y-3">
+            <input value={authUser} onChange={(e) => setAuthUser(e.target.value)} placeholder="Usuario" className="w-full bg-slate-800 px-3 py-2 rounded-xl outline-none" />
+            <input value={authPass} onChange={(e) => setAuthPass(e.target.value)} placeholder="Contraseña" type="password" className="w-full bg-slate-800 px-3 py-2 rounded-xl outline-none" />
+            {authError ? <p className="text-red-400 text-sm">{authError}</p> : null}
+            <div className="flex items-center justify-between">
+              <button onClick={() => setAuthMode(authMode === "signin" ? "signup" : "signin")} className="text-sm opacity-80 hover:opacity-100">
+                {authMode === "signin" ? "Crear cuenta nueva" : "Ya tengo cuenta"}
+              </button>
+              <button onClick={doAuth} className="bg-emerald-500 hover:bg-emerald-600 text-white px-4 py-2 rounded-xl font-medium">{authMode === "signin" ? "Entrar" : "Registrarme"}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Main app when logged in
+  return (
+    <div className="min-h-screen w-full bg-gradient-to-b from-slate-900 via-slate-950 to-black text-slate-100 p-6">
+      {/* Header / Profile */}
+      <div className="max-w-6xl mx-auto mb-6 flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-2xl overflow-hidden bg-slate-800 grid place-items-center">
+            {currentUser.avatar ? (
+              <img src={currentUser.avatar} alt="avatar" className="w-full h-full object-cover" />
+            ) : (
+              <User className="w-6 h-6 opacity-70" />
+            )}
+          </div>
+          <div>
+            <h1 className="text-xl font-semibold">OpenAudio</h1>
+            <p className="text-sm opacity-70">Hola, @{currentUser.username}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            value={currentUser.avatar || ""}
+            onChange={(e) => updateCurrent({ avatar: e.target.value })}
+            placeholder="URL avatar (opcional)"
+            className="bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm w-56"
+          />
+          <input
+            type="color"
+            value={currentUser.color || "#111827"}
+            onChange={(e) => updateCurrent({ color: e.target.value })}
+            className="w-10 h-10 rounded-xl overflow-hidden cursor-pointer"
+            title="Color de acento"
+          />
+          <button onClick={signOut} className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 flex items-center gap-2"><LogOut className="w-4 h-4" />Salir</button>
+        </div>
+      </div>
+
+      {/* Supabase config (optional) */}
+      <div className="max-w-6xl mx-auto mb-6 bg-slate-800/30 rounded-2xl p-4 border border-slate-700/40">
+        <h3 className="font-semibold mb-3">Supabase (opcional) — copia de seguridad / sincronización</h3>
+        <div className="grid md:grid-cols-4 gap-2 items-center">
+          <input className="bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" placeholder="URL" value={supabase.cfg?.url || ""} onChange={(e) => supabase.setCfg({ url: e.target.value, key: supabase.cfg?.key || "", bucket: supabase.cfg?.bucket || "open-audio" })} />
+          <input className="bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" placeholder="Anon Key" value={supabase.cfg?.key || ""} onChange={(e) => supabase.setCfg({ url: supabase.cfg?.url || "", key: e.target.value, bucket: supabase.cfg?.bucket || "open-audio" })} />
+          <input className="bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" placeholder="Bucket (storage)" value={supabase.cfg?.bucket || "open-audio"} onChange={(e) => supabase.setCfg({ url: supabase.cfg?.url || "", key: supabase.cfg?.key || "", bucket: e.target.value })} />
+          <div className="text-xs opacity-70">Se guardará un archivo <code>snapshot.json</code> por usuario.</div>
+        </div>
+      </div>
+
+      {/* Player + Add Track */}
+      <div className="max-w-6xl mx-auto grid md:grid-cols-3 gap-6">
+        {/* Player */}
+        <div className="md:col-span-2 bg-slate-800/30 rounded-2xl p-5 backdrop-blur border border-slate-700/40">
+          <div className="flex gap-5">
+            <div className="w-40 h-40 rounded-2xl overflow-hidden bg-slate-800 flex items-center justify-center">
+              {active?.cover ? (
+                <img src={active.cover} className="w-full h-full object-cover" />
+              ) : (
+                <Disc3 className="w-10 h-10 opacity-60" />
+              )}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="mb-2">
+                <div className="text-lg font-semibold truncate" style={{ color: currentUser.color || "#22c55e" }}>{active?.title || "—"}</div>
+                <div className="text-sm opacity-70 truncate">{active?.artist || ""}</div>
+              </div>
+
+              {/* Progress */}
+              <div className="flex items-center gap-3">
+                <span className="text-xs tabular-nums w-10 text-right">{fmtTime(progress)}</span>
+                <input type="range" min={0} max={Number.isFinite(duration) ? Math.max(0, Math.floor(duration)) : 0} value={Math.floor(progress)} onChange={(e) => seek(Number(e.target.value))} className="flex-1 cursor-pointer" />
+                <span className="text-xs tabular-nums w-10">{fmtTime(duration)}</span>
+              </div>
+
+              {/* Controls */}
+              <div className="mt-4 flex items-center gap-3">
+                <button onClick={prev} className="px-3 py-2 rounded-xl bg-slate-700/50 hover:bg-slate-700/70"><SkipBack className="w-5 h-5" /></button>
+                <button onClick={togglePlay} className="px-4 py-2 rounded-2xl bg-slate-100 text-slate-900 hover:opacity-90 font-medium flex items-center gap-2" style={{ backgroundColor: currentUser.color || "#22c55e", color: "white" }}>
+                  {isPlaying ? (<><Pause className="w-5 h-5" /><span>Pausa</span></>) : (<><Play className="w-5 h-5" /><span>Play</span></>)}
+                </button>
+                <button onClick={next} className="px-3 py-2 rounded-xl bg-slate-700/50 hover:bg-slate-700/70"><SkipForward className="w-5 h-5" /></button>
+
+                <button onClick={() => setSettings({ ...settings, shuffle: !settings.shuffle })} className={`px-3 py-2 rounded-xl bg-slate-700/50 hover:bg-slate-700/70 ${settings.shuffle ? "ring-2 ring-offset-2 ring-offset-slate-900" : ""}`} title="Shuffle">
+                  <Shuffle className="w-5 h-5" />
+                </button>
+                <button onClick={() => setSettings({ ...settings, loop: !settings.loop })} className={`px-3 py-2 rounded-xl bg-slate-700/50 hover:bg-slate-700/70 ${settings.loop ? "ring-2 ring-offset-2 ring-offset-slate-900" : ""}`} title="Loop">
+                  <Repeat className="w-5 h-5" />
+                </button>
+
+                <div className="ml-auto flex items-center gap-2">
+                  {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+                  <input type="range" min={0} max={1} step={0.01} value={settings.volume} onChange={(e) => setVol(Number(e.target.value))} />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <audio ref={audioRef} src={active?.url} onLoadedMetadata={handleLoaded} onTimeUpdate={handleTime} onEnded={handleEnd} preload="metadata" />
+        </div>
+
+        {/* Add Track */}
+        <div className="bg-slate-800/30 rounded-2xl p-4 backdrop-blur border border-slate-700/40">
+          <h3 className="font-semibold mb-3 flex items-center gap-2"><Upload className="w-4 h-4" /> Agregar audio</h3>
+          <div className="space-y-2">
+            <input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="Título" className="w-full bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" />
+            <input value={newArtist} onChange={(e) => setNewArtist(e.target.value)} placeholder="Artista (opcional)" className="w-full bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" />
+            <div className="grid grid-cols-2 gap-2">
+              <label className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-dashed border-slate-600 hover:bg-slate-800/40 cursor-pointer">
+                <Upload className="w-4 h-4" /> Audio (archivo)
+                <input type="file" accept="audio/*" className="hidden" onChange={(e) => onPickAudio(e.target.files)} />
+              </label>
+              <input value={newAudioUrl} onChange={(e) => setNewAudioUrl(e.target.value)} placeholder="o URL .mp3/.ogg/.wav" className="w-full bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-dashed border-slate-600 hover:bg-slate-800/40 cursor-pointer">
+                <Upload className="w-4 h-4" /> Portada (imagen)
+                <input type="file" accept="image/*" className="hidden" onChange={(e) => onPickCover(e.target.files)} />
+              </label>
+              <input value={newCoverUrl} onChange={(e) => setNewCoverUrl(e.target.value)} placeholder="o URL de imagen" className="w-full bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" />
+            </div>
+            {formError ? <p className="text-red-400 text-sm">{formError}</p> : <p className="text-xs opacity-60">Los archivos se mantienen localmente (blob URL). Para producción usa almacenamiento externo.</p>}
+            <button onClick={addTrack} className="w-full bg-slate-100 text-slate-900 rounded-xl py-2 font-medium hover:opacity-90" style={{ backgroundColor: currentUser.color || "#22c55e", color: "white" }}>Añadir</button>
+          </div>
+        </div>
+      </div>
+
+      {/* Conditional Main Area: Playlist Detail or Library */}
+      {activePlaylistId ? (
+        <PlaylistDetail
+          playlist={playlists.find((p) => p.id === activePlaylistId)!}
+          tracks={tracks}
+          onBack={() => setActivePlaylistId(null)}
+          onPlayAll={(ids) => setQueue(ids, 0)}
+          onPlayOne={(ids, idx) => setQueue(ids, idx)}
+          shuffle={settings.shuffle}
+          setShuffle={(v) => setSettings({ ...settings, shuffle: v })}
+          accent={currentUser.color || "#22c55e"}
+        />
+      ) : (
+        <div className="max-w-6xl mx-auto mt-6 grid md:grid-cols-2 gap-6">
+          {/* Playlists */}
+          <div className="bg-slate-800/30 rounded-2xl p-4 backdrop-blur border border-slate-700/40">
+            <h3 className="font-semibold mb-3 flex items-center gap-2"><Music2 className="w-4 h-4" /> Tus listas</h3>
+            <div className="flex items-center gap-2 mb-3">
+              <input value={plTitle} onChange={(e) => setPlTitle(e.target.value)} placeholder="Nombre de la lista" className="flex-1 bg-slate-800/70 px-3 py-2 rounded-xl outline-none text-sm" />
+              <input type="color" value={plColor} onChange={(e) => setPlColor(e.target.value)} className="w-10 h-10 rounded-xl" />
+              <label className="px-3 py-2 rounded-xl border border-dashed border-slate-600 hover:bg-slate-800/40 cursor-pointer text-sm">Portada
+                <input type="file" accept="image/*" className="hidden" onChange={(e) => setPlCoverFile(e.target.files?.[0] || null)} />
+              </label>
+              <button onClick={createPlaylist} className="px-3 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white font-medium">Crear</button>
+            </div>
+            <ul className="divide-y divide-slate-700/40">
+              {sortedPlaylists.map((pl) => (
+                <li key={pl.id} className="flex items-center gap-3 py-3 cursor-pointer hover:bg-slate-700/30 rounded-xl px-2" onClick={() => setActivePlaylistId(pl.id)}>
+                  <div className="w-12 h-12 rounded-xl overflow-hidden bg-slate-800 grid place-items-center" style={{ outline: `3px solid ${pl.color || "transparent"}` }}>
+                    {pl.cover ? <img src={pl.cover} className="w-full h-full object-cover" /> : <ImageIcon className="w-5 h-5 opacity-60" />}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{pl.title}</div>
+                    <div className="text-xs opacity-60">{pl.trackIds.length} canciones</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {/* Tracks */}
+          <div className="bg-slate-800/30 rounded-2xl p-4 backdrop-blur border border-slate-700/40">
+            <h3 className="font-semibold mb-3 flex items-center gap-2"><Music2 className="w-4 h-4" /> Canciones</h3>
+            <ul className="divide-y divide-slate-700/40">
+              {tracks.map((t, i) => (
+                <li key={t.id} className={`flex items-center gap-3 py-3 ${active?.id === t.id ? "bg-slate-700/30 rounded-xl px-3" : ""}`}>
+                  <button onClick={() => setSettings({ ...settings, currentIndex: i, queue: [], queueIndex: 0 })} className="flex items-center gap-3 flex-1 text-left group">
+                    <div className="relative w-12 h-12 rounded-xl overflow-hidden bg-slate-800 grid place-items-center">
+                      {t.cover ? <img src={t.cover} className="w-full h-full object-cover" /> : <ImageIcon className="w-5 h-5 opacity-60" />}
+                      <div className="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/50">
+                        <Play className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">{t.title}</div>
+                      <div className="text-sm opacity-60 truncate">{t.artist || new URL(t.url, window.location.href).hostname || ""}</div>
+                    </div>
+                  </button>
+                  <div className="text-xs tabular-nums opacity-70 w-12 text-right">{t.duration ? fmtTime(t.duration) : ""}</div>
+                  <button onClick={() => openAddModal(t.id)} className="p-2 rounded-lg hover:bg-slate-700/60" title="Agregar a listas">
+                    <Plus className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => removeTrack(t.id)} className="p-2 rounded-lg hover:bg-slate-700/60" title="Eliminar">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* Add to playlists modal */}
+      <Modal open={addModalTrackId !== null} onClose={() => setAddModalTrackId(null)} title="Agregar a listas de reproducción">
+        <div className="max-h-[50vh] overflow-y-auto pr-1">
+          {sortedPlaylists.length === 0 ? (
+            <p className="text-sm opacity-70">No tienes listas aún. Crea una a la izquierda.</p>
+          ) : (
+            <ul className="space-y-2">
+              {sortedPlaylists.map((pl) => (
+                <li key={pl.id}>
+                  <button onClick={() => toggleSelectPl(pl.id)} className={`w-full text-left px-3 py-2 rounded-xl border border-slate-700 flex items-center gap-3 ${selectedPlaylistIds.has(pl.id) ? "bg-slate-800" : "bg-transparent"}`}>
+                    <div className="w-10 h-10 rounded-lg overflow-hidden bg-slate-800 grid place-items-center" style={{ outline: `2px solid ${pl.color || "transparent"}` }}>
+                      {pl.cover ? <img src={pl.cover} className="w-full h-full object-cover" /> : <ImageIcon className="w-4 h-4 opacity-60" />}
+                    </div>
+                    <span className="flex-1">{pl.title}</span>
+                    {selectedPlaylistIds.has(pl.id) ? <Check className="w-4 h-4" /> : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <button onClick={() => setAddModalTrackId(null)} className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700">Cancelar</button>
+          <button onClick={confirmAddToPlaylists} className="px-3 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white font-medium">Confirmar</button>
+        </div>
+      </Modal>
+
+      {/* Accent color for ranges */}
+      <style>{`
+        input[type=range] { accent-color: ${currentUser.color || "#22c55e"}; }
+      `}</style>
+    </div>
+  );
+}
+
+// ------------------------ Playlist Detail Component ------------------------
+function PlaylistDetail({
+  playlist,
+  tracks,
+  onBack,
+  onPlayAll,
+  onPlayOne,
+  shuffle,
+  setShuffle,
+  accent,
+}: {
+  playlist: Playlist;
+  tracks: Track[];
+  onBack: () => void;
+  onPlayAll: (ids: string[]) => void;
+  onPlayOne: (ids: string[], idx: number) => void;
+  shuffle: boolean;
+  setShuffle: (v: boolean) => void;
+  accent: string;
+}) {
+  const trackObjs = playlist.trackIds.map((id) => tracks.find((t) => t.id === id)).filter(Boolean) as Track[];
+
+  return (
+    <div className="max-w-6xl mx-auto mt-6">
+      <button onClick={onBack} className="mb-4 flex items-center gap-2 text-sm opacity-80 hover:opacity-100"><ArrowLeft className="w-4 h-4" /> Volver</button>
+
+      <div className="bg-gradient-to-b from-slate-800/70 to-slate-900/30 rounded-2xl p-6 border border-slate-700/40">
+        <div className="flex items-center gap-4">
+          <div className="w-28 h-28 rounded-xl overflow-hidden bg-slate-800 grid place-items-center" style={{ outline: `3px solid ${playlist.color || "transparent"}` }}>
+            {playlist.cover ? <img src={playlist.cover} className="w-full h-full object-cover" /> : <ImageIcon className="w-6 h-6 opacity-60" />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-xs opacity-70 mb-1">Lista</div>
+            <h2 className="text-2xl font-bold truncate">{playlist.title}</h2>
+            <div className="text-xs opacity-70">{trackObjs.length} canciones</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={() => onPlayAll(playlist.trackIds)} className="px-4 py-2 rounded-2xl text-white font-medium" style={{ backgroundColor: accent }}>Reproducir</button>
+            <button onClick={() => setShuffle(!shuffle)} className={`px-3 py-2 rounded-xl bg-slate-700/50 hover:bg-slate-700/70 ${shuffle ? "ring-2 ring-offset-2 ring-offset-slate-900" : ""}`} title="Modo aleatorio">
+              <Shuffle className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Table header */}
+        <div className="mt-6 grid grid-cols-[40px_minmax(0,1fr)_200px_80px] px-3 text-sm opacity-70">
+          <div>#</div>
+          <div>Título</div>
+          <div>Artista</div>
+          <div className="text-right">Duración</div>
+        </div>
+        <div className="mt-2 divide-y divide-slate-700/40">
+          {trackObjs.map((t, idx) => (
+            <div key={t.id} className="group grid grid-cols-[40px_minmax(0,1fr)_200px_80px] items-center gap-3 px-3 py-2 hover:bg-slate-800/40 rounded-lg">
+              <div className="tabular-nums opacity-70">{idx + 1}</div>
+              <button onClick={() => onPlayOne(playlist.trackIds, idx)} className="flex items-center gap-3 text-left">
+                <div className="relative w-10 h-10 rounded-lg overflow-hidden bg-slate-800 grid place-items-center">
+                  {t.cover ? <img src={t.cover} className="w-full h-full object-cover" /> : <ImageIcon className="w-4 h-4 opacity-60" />}
+                  <div className="absolute inset-0 hidden group-hover:flex items-center justify-center bg-black/50">
+                    <Play className="w-4 h-4" />
+                  </div>
+                </div>
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{t.title}</div>
+                </div>
+              </button>
+              <div className="truncate text-sm opacity-80">{t.artist || ""}</div>
+              <div className="text-right text-xs tabular-nums opacity-70">{t.duration ? fmtTime(t.duration) : ""}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------------------------ Dev Tests (non-invasive) ------------------------
+function runDevTests(): void {
+  console.group("OpenAudio Dev Tests");
+  console.assert(typeof uid() === "string" && uid().length >= 5, "uid should return a short id");
+  console.assert(fmtTime(0) === "0:00", "fmtTime 0");
+  console.assert(fmtTime(65) === "1:05", "fmtTime 65");
+  console.assert(hash("abc") === hash("abc"), "hash deterministic");
+
+  // Queue logic
+  const q = ["a", "b", "c"]; let queueIndex = 0;
+  const nextIdx = (idx: number, len: number) => (idx + 1) % len;
+  queueIndex = nextIdx(queueIndex, q.length);
+  console.assert(queueIndex === 1, "queue next idx");
+
+  // Multi-select toggle logic
+  const toggle = (set: Set<string>, id: string): Set<string> => { const s = new Set(set); if (s.has(id)) s.delete(id); else s.add(id); return s; };
+  let s = new Set<string>();
+  s = toggle(s, "a");
+  console.assert(s.has("a"), "toggle add");
+  s = toggle(s, "a");
+  console.assert(!s.has("a"), "toggle remove");
+  console.groupEnd();
+}
+if (typeof window !== "undefined") { try { runDevTests(); } catch (e) { console.warn("Dev tests failed", e); } }
